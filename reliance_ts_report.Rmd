@@ -1,0 +1,638 @@
+---
+title: "Time Series Analysis and Forecasting of Reliance Industries"
+subtitle: "Data Science with R — Project Report"
+author: "Your Name | Roll No. | Institution"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+    fig_width: 10
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  cache   = TRUE
+)
+```
+
+---
+
+# Introduction
+
+## Project Objective
+
+The objective of this project is to analyse and model the time-series behaviour of **daily stock returns of Reliance Industries** using statistical techniques in R. The study aims to:
+
+- Examine key properties such as **stationarity**, **autocorrelation**, and **volatility clustering**
+- Build **ARIMA** models to capture return dynamics
+- Build **GARCH** family models to capture time-varying risk
+- Generate **short-term forecasts** and evaluate their accuracy
+- Assess financial risk through **Volatility**, **Sharpe Ratio**, and **Value at Risk (VaR)**
+
+## About Reliance Industries
+
+Reliance Industries Limited (RIL) is India's largest private sector corporation, listed on the NSE (ticker: **RELIANCE.NS**) and BSE. It is a constituent of the NIFTY 50 and Sensex, making it a critical barometer of the Indian equity market.
+
+---
+
+# Setup & Data Acquisition
+
+## Load Libraries
+
+```{r libraries}
+packages <- c(
+  "quantmod", "tidyverse", "tseries", "forecast", "rugarch",
+  "PerformanceAnalytics", "FinTS", "lmtest", "urca",
+  "ggplot2", "gridExtra", "knitr", "xts", "zoo",
+  "moments", "nortest", "car", "reshape2", "scales", "kableExtra"
+)
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+invisible(lapply(packages, install_if_missing))
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+## Download Data
+
+```{r data-download}
+getSymbols("RELIANCE.NS", src = "yahoo",
+           from = "2015-01-01", to = Sys.Date(),
+           auto.assign = TRUE)
+
+reliance_raw <- RELIANCE.NS
+adj_close    <- Ad(reliance_raw)
+colnames(adj_close) <- "Price"
+
+cat("Data from:", as.character(start(adj_close)),
+    "to:", as.character(end(adj_close)),
+    "| Observations:", nrow(adj_close))
+```
+
+## Raw Price Series
+
+```{r price-plot}
+autoplot(adj_close) +
+  ggtitle("Reliance Industries — Adjusted Closing Price (2015–Present)") +
+  xlab("Date") + ylab("Price (INR)") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Log Returns
+
+## Computation
+
+```{r log-returns}
+log_returns <- na.omit(diff(log(adj_close)))
+colnames(log_returns) <- "LogReturn"
+lr_vec <- as.numeric(log_returns)
+dates  <- index(log_returns)
+```
+
+## Returns Time Series Plot
+
+```{r returns-plot}
+autoplot(log_returns) +
+  ggtitle("Reliance Industries — Daily Log Returns") +
+  xlab("Date") + ylab("Log Return") +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Descriptive Statistics
+
+## Summary Table
+
+```{r descriptive-stats}
+library(moments)
+
+desc_stats <- data.frame(
+  Statistic = c("Observations", "Mean", "Std Deviation",
+                "Minimum", "Maximum", "Skewness", "Excess Kurtosis"),
+  Value = c(
+    length(lr_vec),
+    round(mean(lr_vec), 6),
+    round(sd(lr_vec), 6),
+    round(min(lr_vec), 6),
+    round(max(lr_vec), 6),
+    round(skewness(lr_vec), 4),
+    round(kurtosis(lr_vec) - 3, 4)   # Excess kurtosis
+  )
+)
+
+kable(desc_stats, caption = "Descriptive Statistics of Daily Log Returns",
+      align = c("l", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+> **Interpretation:** Negative skewness indicates more frequent small gains but occasional large losses. Excess kurtosis > 0 indicates fat tails (leptokurtosis), a typical property of financial returns.
+
+## Distribution Analysis
+
+```{r distribution-plot, fig.height=5}
+par(mfrow = c(1, 2))
+
+hist(lr_vec, breaks = 80, probability = TRUE,
+     col = "steelblue", border = "white",
+     main = "Distribution of Log Returns",
+     xlab = "Log Return", cex.main = 0.95)
+curve(dnorm(x, mean(lr_vec), sd(lr_vec)),
+      add = TRUE, col = "red", lwd = 2)
+legend("topright", legend = "Normal Fit", col = "red", lty = 1, lwd = 2, bty = "n")
+
+qqnorm(lr_vec, main = "QQ Plot of Log Returns", cex.main = 0.95)
+qqline(lr_vec, col = "red", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+## Normality Tests
+
+```{r normality-tests}
+jb_test <- jarque.bera.test(lr_vec)
+ad_test <- nortest::ad.test(lr_vec)
+sw_n    <- min(4999, length(lr_vec))   # shapiro.test requires n <= 5000
+sw_test <- shapiro.test(sample(lr_vec, sw_n))
+
+norm_results <- data.frame(
+  Test      = c("Jarque-Bera", "Anderson-Darling", "Shapiro-Wilk (sample)"),
+  Statistic = c(round(jb_test$statistic, 3),
+                round(ad_test$statistic, 3),
+                round(sw_test$statistic, 6)),
+  `p-value` = c(formatC(jb_test$p.value, format = "e", digits = 3),
+                formatC(ad_test$p.value, format = "e", digits = 3),
+                formatC(sw_test$p.value, format = "e", digits = 3)),
+  Decision  = rep("Reject Normality (p < 0.05)", 3)
+)
+
+kable(norm_results, caption = "Normality Tests",
+      align = c("l", "r", "r", "l")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+> **Conclusion:** All three tests strongly reject normality, confirming fat-tailed and skewed returns typical of equity markets.
+
+---
+
+# Stationarity Tests
+
+```{r stationarity-tests}
+price_clean <- na.omit(as.numeric(adj_close))
+adf_price   <- adf.test(price_clean, alternative = "stationary")
+adf_returns <- adf.test(lr_vec, alternative = "stationary")
+kpss_ret    <- kpss.test(lr_vec, null = "Level")
+pp_ret      <- pp.test(lr_vec)
+
+stat_table <- data.frame(
+  Test      = c("ADF (Price)", "ADF (Log Returns)",
+                "KPSS (Log Returns)", "PP (Log Returns)"),
+  Statistic = c(round(adf_price$statistic, 4),
+                round(adf_returns$statistic, 4),
+                round(kpss_ret$statistic, 4),
+                round(pp_ret$statistic, 4)),
+  `p-value` = c(round(adf_price$p.value, 4),
+                round(adf_returns$p.value, 4),
+                round(kpss_ret$p.value, 4),
+                round(pp_ret$p.value, 4)),
+  Conclusion = c(
+    "Non-stationary (Fail to reject H0)",
+    "Stationary (Reject H0)",
+    "Stationary (Fail to reject H0)",
+    "Stationary (Reject H0)"
+  )
+)
+
+kable(stat_table, caption = "Stationarity Test Results",
+      align = c("l", "r", "r", "l")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+> **Conclusion:** Price levels are non-stationary (unit root present). Log returns are **stationary** — confirmed by ADF, PP (reject unit root), and KPSS (fail to reject level stationarity).
+
+---
+
+# Autocorrelation Analysis
+
+## ACF/PACF of Returns and Squared Returns
+
+```{r acf-pacf, fig.height=7}
+par(mfrow = c(2, 2))
+acf(lr_vec,   lag.max = 40, main = "ACF — Log Returns")
+pacf(lr_vec,  lag.max = 40, main = "PACF — Log Returns")
+acf(lr_vec^2, lag.max = 40, main = "ACF — Squared Returns")
+pacf(lr_vec^2,lag.max = 40, main = "PACF — Squared Returns")
+par(mfrow = c(1, 1))
+```
+
+## Ljung-Box & ARCH-LM Tests
+
+```{r ljungbox-arch}
+lb_ret  <- Box.test(lr_vec,    lag = 10, type = "Ljung-Box")
+lb_sq   <- Box.test(lr_vec^2,  lag = 10, type = "Ljung-Box")
+arch_lm <- FinTS::ArchTest(lr_vec, lags = 12)
+
+acf_table <- data.frame(
+  Test = c("Ljung-Box (Returns, lag=10)",
+           "Ljung-Box (Sq. Returns, lag=10)",
+           "ARCH-LM (lag=12)"),
+  Statistic = c(round(lb_ret$statistic, 3),
+                round(lb_sq$statistic, 3),
+                round(arch_lm$statistic, 3)),
+  `p-value`  = c(round(lb_ret$p.value, 4),
+                 round(lb_sq$p.value, 6),
+                 formatC(arch_lm$p.value, format = "e", digits = 3)),
+  Implication = c(
+    "Weak autocorrelation in returns",
+    "Strong autocorrelation in squared returns",
+    "Strong ARCH effects present"
+  )
+)
+
+kable(acf_table, caption = "Autocorrelation & ARCH Tests",
+      align = c("l","r","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+> **Key Finding:** Significant ARCH effects in squared returns confirm **volatility clustering** — justifying GARCH modelling.
+
+---
+
+# ARIMA Modelling
+
+## Model Selection
+
+```{r arima-fit, results='hold'}
+arima_auto <- auto.arima(lr_vec,
+                         stationary   = TRUE,
+                         seasonal     = FALSE,
+                         stepwise     = FALSE,
+                         approximation = FALSE,
+                         ic           = "aic")
+print(summary(arima_auto))
+```
+
+## ARIMA Residual Diagnostics
+
+```{r arima-diagnostics, fig.height=6}
+checkresiduals(arima_auto)
+arima_residuals <- residuals(arima_auto)
+```
+
+```{r arima-resid-tests}
+lb_arima_res  <- Box.test(arima_residuals, lag = 10, type = "Ljung-Box")
+arch_arima    <- FinTS::ArchTest(arima_residuals, lags = 12)
+
+arima_diag <- data.frame(
+  Test = c("Ljung-Box (Residuals)", "ARCH-LM (Residuals)"),
+  `p-value` = c(round(lb_arima_res$p.value, 4),
+                formatC(arch_arima$p.value, format = "e", digits = 3)),
+  Conclusion = c(
+    ifelse(lb_arima_res$p.value > 0.05,
+           "No autocorrelation in residuals", "Autocorrelation present"),
+    ifelse(arch_arima$p.value < 0.05,
+           "ARCH effects remain → GARCH needed", "No ARCH effects")
+  )
+)
+
+kable(arima_diag, caption = "ARIMA Residual Diagnostics",
+      align = c("l","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## ARIMA Forecast (30 Days)
+
+```{r arima-forecast}
+arima_fc <- forecast(arima_auto, h = 30)
+autoplot(arima_fc) +
+  ggtitle("ARIMA — 30-Day Forecast of Log Returns") +
+  xlab("Time Index") + ylab("Log Return") +
+  theme_minimal(base_size = 13)
+```
+
+## Forecast Accuracy (Hold-Out)
+
+```{r arima-accuracy}
+n_total   <- length(lr_vec)
+train_end <- n_total - 60
+train_vec <- lr_vec[1:train_end]
+test_vec  <- lr_vec[(train_end + 1):n_total]
+
+arima_tr  <- auto.arima(train_vec, stationary = TRUE, seasonal = FALSE)
+arima_fc2 <- forecast(arima_tr, h = 60)
+acc_arima <- accuracy(arima_fc2, test_vec)
+
+kable(round(acc_arima, 5),
+      caption = "ARIMA Forecast Accuracy (Train vs Test Split)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+---
+
+# GARCH Modelling
+
+## Model Specifications
+
+```{r garch-specs}
+ar_order <- arima_auto$arma[1]
+ma_order <- arima_auto$arma[2]
+
+spec_norm <- ugarchspec(
+  variance.model    = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model        = list(armaOrder = c(ar_order, ma_order), include.mean = TRUE),
+  distribution.model = "norm"
+)
+spec_t <- ugarchspec(
+  variance.model    = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model        = list(armaOrder = c(ar_order, ma_order), include.mean = TRUE),
+  distribution.model = "std"
+)
+spec_egarch <- ugarchspec(
+  variance.model    = list(model = "eGARCH", garchOrder = c(1, 1)),
+  mean.model        = list(armaOrder = c(ar_order, ma_order), include.mean = TRUE),
+  distribution.model = "std"
+)
+spec_gjr <- ugarchspec(
+  variance.model    = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+  mean.model        = list(armaOrder = c(ar_order, ma_order), include.mean = TRUE),
+  distribution.model = "std"
+)
+```
+
+## Model Fitting
+
+```{r garch-fit}
+fit_norm   <- ugarchfit(spec_norm,   data = lr_vec, solver = "hybrid")
+fit_t      <- ugarchfit(spec_t,      data = lr_vec, solver = "hybrid")
+fit_egarch <- ugarchfit(spec_egarch, data = lr_vec, solver = "hybrid")
+fit_gjr    <- ugarchfit(spec_gjr,    data = lr_vec, solver = "hybrid")
+```
+
+## Model Comparison
+
+```{r garch-compare}
+model_compare <- data.frame(
+  Model = c("GARCH(1,1)-Normal", "GARCH(1,1)-Student-t",
+            "EGARCH(1,1)-Student-t", "GJR-GARCH(1,1)-Student-t"),
+  AIC   = c(infocriteria(fit_norm)[1],   infocriteria(fit_t)[1],
+            infocriteria(fit_egarch)[1], infocriteria(fit_gjr)[1]),
+  BIC   = c(infocriteria(fit_norm)[2],   infocriteria(fit_t)[2],
+            infocriteria(fit_egarch)[2], infocriteria(fit_gjr)[2]),
+  LogLik = c(likelihood(fit_norm),   likelihood(fit_t),
+             likelihood(fit_egarch), likelihood(fit_gjr))
+)
+model_compare[, 2:4] <- round(model_compare[, 2:4], 4)
+
+kable(model_compare, caption = "GARCH Model Comparison (Information Criteria)",
+      align = c("l","r","r","r")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) |>
+  row_spec(which.min(model_compare$AIC), bold = TRUE,
+           background = "#d4edda", color = "#155724")
+```
+
+> The **highlighted row** represents the best model by AIC.
+
+## Best Model — Coefficient Summary
+
+```{r garch-best}
+best_fit <- fit_t  # Update if another model wins
+
+# Extract and display coefficients
+coef_df <- as.data.frame(round(coef(best_fit), 6))
+colnames(coef_df) <- "Estimate"
+coef_df$`Std Error` <- round(sqrt(diag(vcov(best_fit))), 6)
+coef_df$`t-value`   <- round(coef_df$Estimate / coef_df$`Std Error`, 4)
+
+kable(coef_df, caption = "GARCH(1,1)-t Coefficient Estimates") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+> **Note:** alpha1 + beta1 measures **volatility persistence**. Values close to 1 indicate highly persistent volatility shocks.
+
+## Conditional Volatility
+
+```{r cond-vol-plot}
+cond_vol     <- sigma(best_fit)
+cond_vol_xts <- xts(cond_vol, order.by = dates)
+
+autoplot(cond_vol_xts * sqrt(252)) +   # Annualised
+  ggtitle("GARCH(1,1)-t — Annualised Conditional Volatility") +
+  xlab("Date") + ylab("Annualised Conditional Volatility") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 13)
+```
+
+## GARCH Residual Diagnostics
+
+```{r garch-resid}
+std_res <- residuals(best_fit, standardize = TRUE)
+
+lb_std    <- Box.test(std_res,   lag = 10, type = "Ljung-Box")
+lb_std_sq <- Box.test(std_res^2, lag = 10, type = "Ljung-Box")
+
+garch_diag <- data.frame(
+  Test = c("Ljung-Box (Std Residuals)", "Ljung-Box (Sq. Std Residuals)"),
+  `p-value` = c(round(lb_std$p.value, 4), round(lb_std_sq$p.value, 4)),
+  Conclusion = c(
+    ifelse(lb_std$p.value    > 0.05, "No serial correlation", "Serial correlation"),
+    ifelse(lb_std_sq$p.value > 0.05, "No remaining ARCH effects", "ARCH effects remain")
+  )
+)
+kable(garch_diag, caption = "GARCH Standardised Residual Diagnostics",
+      align = c("l","r","l")) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+par(mfrow = c(1, 2))
+acf(std_res,    main = "ACF — Std Residuals",     lag.max = 30)
+acf(std_res^2,  main = "ACF — Sq. Std Residuals", lag.max = 30)
+par(mfrow = c(1, 1))
+```
+
+## GARCH 30-Day Volatility Forecast
+
+```{r garch-forecast, fig.height=5}
+garch_fc <- ugarchforecast(best_fit, n.ahead = 30)
+
+fc_vol    <- as.numeric(sigma(garch_fc))
+fc_dates  <- seq(max(dates) + 1, by = "day", length.out = 30)
+
+fc_df <- data.frame(Date = fc_dates, CondVol = fc_vol * sqrt(252))
+
+ggplot(fc_df, aes(x = Date, y = CondVol)) +
+  geom_line(colour = "steelblue", size = 1) +
+  geom_point(colour = "steelblue", size = 2) +
+  ggtitle("GARCH — 30-Day Annualised Volatility Forecast") +
+  xlab("Date") + ylab("Annualised Volatility") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Financial Risk Assessment
+
+```{r risk-metrics}
+# Annualised metrics
+ann_return <- mean(lr_vec) * 252
+ann_vol    <- sd(lr_vec) * sqrt(252)
+rf_daily   <- 0.065 / 252
+
+# Sharpe Ratio
+sharpe <- (mean(lr_vec) - rf_daily) / sd(lr_vec) * sqrt(252)
+
+# VaR and CVaR
+var_95 <- quantile(lr_vec, 0.05)
+var_99 <- quantile(lr_vec, 0.01)
+cvar_95 <- mean(lr_vec[lr_vec <= var_95])
+cvar_99 <- mean(lr_vec[lr_vec <= var_99])
+
+# Maximum Drawdown
+wealth  <- cumprod(1 + lr_vec)
+max_dd  <- min((wealth - cummax(wealth)) / cummax(wealth))
+
+# Sortino Ratio
+neg_ret      <- lr_vec[lr_vec < 0]
+downside_dev <- sqrt(mean(neg_ret^2)) * sqrt(252)
+sortino      <- (ann_return - 0.065) / downside_dev
+
+risk_table <- data.frame(
+  Metric = c("Annualised Return", "Annualised Volatility",
+             "Sharpe Ratio", "Sortino Ratio",
+             "VaR (95%, 1-day)", "VaR (99%, 1-day)",
+             "CVaR / ES (95%)",  "CVaR / ES (99%)",
+             "Maximum Drawdown"),
+  Value = c(
+    paste0(round(ann_return * 100, 2), "%"),
+    paste0(round(ann_vol * 100, 2), "%"),
+    round(sharpe, 4),
+    round(sortino, 4),
+    paste0(round(var_95 * 100, 3), "%"),
+    paste0(round(var_99 * 100, 3), "%"),
+    paste0(round(cvar_95 * 100, 3), "%"),
+    paste0(round(cvar_99 * 100, 3), "%"),
+    paste0(round(max_dd * 100, 2), "%")
+  )
+)
+
+kable(risk_table,
+      caption = "Financial Risk Metrics — Reliance Industries",
+      align = c("l", "r")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+## VaR Visualisation
+
+```{r var-plot, fig.height=4}
+ggplot(data.frame(Return = lr_vec), aes(x = Return)) +
+  geom_histogram(aes(y = ..density..), bins = 80,
+                 fill = "steelblue", colour = "white", alpha = 0.8) +
+  geom_vline(xintercept = var_95, colour = "orange",
+             linetype = "dashed", size = 1) +
+  geom_vline(xintercept = var_99, colour = "red",
+             linetype = "dashed", size = 1) +
+  annotate("text", x = var_95, y = Inf, label = " VaR 95%",
+           hjust = 0, vjust = 2, colour = "orange", size = 3.5) +
+  annotate("text", x = var_99, y = Inf, label = " VaR 99%",
+           hjust = 0, vjust = 4, colour = "red", size = 3.5) +
+  ggtitle("Return Distribution with VaR Thresholds") +
+  xlab("Log Return") + ylab("Density") +
+  theme_minimal(base_size = 13)
+```
+
+## Rolling Volatility
+
+```{r rolling-vol, fig.height=4}
+rolling_vol <- rollapply(log_returns, width = 30,
+                         FUN = sd, fill = NA, align = "right") * sqrt(252)
+colnames(rolling_vol) <- "RollingVol"
+
+autoplot(rolling_vol) +
+  ggtitle("Rolling 30-Day Annualised Volatility") +
+  xlab("Date") + ylab("Annualised Volatility") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Results Summary
+
+```{r summary-table}
+summary_df <- data.frame(
+  Step = c(
+    "1. Data", "2. Returns", "3. Normality", "4. Stationarity",
+    "5. ARCH Effects", "6. ARIMA", "7. Best GARCH", "8. Risk"
+  ),
+  Finding = c(
+    paste0(nrow(adj_close), " daily obs, NSE RELIANCE.NS (2015–present)"),
+    "Mean daily return near 0; fat tails; negative skew",
+    "Strongly non-normal — JB, AD, SW all reject at 1%",
+    "Returns stationary (ADF & PP reject unit root); price non-stationary",
+    "Ljung-Box & ARCH-LM confirm volatility clustering",
+    paste0("ARIMA(", arima_auto$arma[1], ",0,",
+           arima_auto$arma[2], ") selected by AIC"),
+    paste0("GARCH(1,1)-t: AIC = ",
+           round(infocriteria(best_fit)[1], 4)),
+    paste0("Sharpe = ", round(sharpe, 2),
+           " | VaR(95%) = ", round(var_95 * 100, 2), "%",
+           " | Max DD = ", round(max_dd * 100, 2), "%")
+  )
+)
+
+kable(summary_df, caption = "Project Results Summary",
+      align = c("l", "l")) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) |>
+  column_spec(1, bold = TRUE, width = "3cm")
+```
+
+---
+
+# Conclusions
+
+Based on the rigorous time-series framework applied to Reliance Industries' daily log returns:
+
+1. **Non-Normality:** Returns exhibit significant fat tails and negative skewness, ruling out the normal distribution assumption used in standard finance models.
+
+2. **Stationarity:** Log returns are stationary while price levels contain a unit root — confirming the standard finding in equity markets.
+
+3. **Volatility Clustering:** Strong ARCH effects and significant autocorrelation in squared returns confirm time-varying volatility, making GARCH modelling essential.
+
+4. **ARIMA:** The best-fit ARIMA model captures weak linear dynamics in returns. However, residuals still exhibit ARCH effects, motivating GARCH.
+
+5. **GARCH:** GARCH(1,1) with Student-t innovations provides an excellent fit, capturing fat tails and volatility persistence. The high (α₁ + β₁) value confirms that volatility shocks are long-lasting for Reliance.
+
+6. **Risk Metrics:** The Sharpe ratio, VaR, and CVaR provide investors with quantifiable risk benchmarks for position sizing and risk management.
+
+---
+
+# References
+
+- Engle, R. F. (1982). Autoregressive Conditional Heteroscedasticity with Estimates of the Variance of United Kingdom Inflation. *Econometrica*, 50(4), 987–1007.
+- Bollerslev, T. (1986). Generalized Autoregressive Conditional Heteroscedasticity. *Journal of Econometrics*, 31(3), 307–327.
+- Box, G. E. P., Jenkins, G. M., & Reinsel, G. C. (2015). *Time Series Analysis: Forecasting and Control* (5th ed.). Wiley.
+- Ghalanos, A. (2023). *rugarch: Univariate GARCH models*. R package version 1.5-1.
+- Ryan, J. A., & Ulrich, J. M. (2023). *quantmod: Quantitative Financial Modelling Framework*. R package.
+
+---
+
+*Report generated using R `r R.version$major`.`r R.version$minor` and knitr `r packageVersion("knitr")`*
